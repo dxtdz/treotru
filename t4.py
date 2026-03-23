@@ -37,6 +37,8 @@ current_delay = 1.0
 simulate_typing = True
 idbox_list = ""
 message_content = ""
+task_messages = {}      # Lưu nội dung message cho từng task
+task_from_names = {}    # Lưu tên from cho từng task
 
 COLOR_ERROR = '\033[91m'
 COLOR_SUCCESS = '\033[92m'
@@ -52,6 +54,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:108.0) Gecko/20100101 Firefox/120.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -83,6 +86,11 @@ def parse_cookie_string(cookie_str):
             cookies[key] = value
     return cookies
 
+def get_uid_from_cookie(cookie):
+    """Lấy UID từ cookie"""
+    cookie_dict = parse_cookie_string(cookie)
+    return cookie_dict.get("c_user", None)
+
 def get_uptime(start_time):
     elapsed = (datetime.now() - start_time).total_seconds()
     hours, rem = divmod(int(elapsed), 3600)
@@ -98,18 +106,114 @@ def show_help():
     print("="*50)
     print(f"{COLOR_INFO}add{COLOR_RESET}     - Them task moi (cookie, id box, file, delay, typing delay)")
     print(f"{COLOR_INFO}stop{COLOR_RESET}    - Dung task theo so thu tu (hien thi danh sach de chon)")
-    print(f"{COLOR_INFO}list{COLOR_RESET}    - Liet ke tat ca task dang chay")
+    print(f"{COLOR_INFO}list{COLOR_RESET}    - Liet ke tat ca task dang chay (dang doc)")
+    print(f"{COLOR_INFO}thay{COLOR_RESET}    - Thay noi dung file cho task (thay [id])")
+    print(f"{COLOR_INFO}from{COLOR_RESET}    - Thay ten from cho task (from [id] [ten] hoac from all [ten])")
     print(f"{COLOR_INFO}delay{COLOR_RESET}   - Thay doi thoi gian delay giua cac tin nhan")
-    print(f"{COLOR_INFO}typing{COLOR_RESET}  - Bat/tat che do typing indicator (hien thi dang soan tin)")
+    print(f"{COLOR_INFO}typing{COLOR_RESET}  - Bat/tat che do typing indicator")
     print(f"{COLOR_INFO}stopall{COLOR_RESET} - Dung tat ca task dang chay")
     print(f"{COLOR_INFO}help{COLOR_RESET}    - Hien thi danh sach lenh nay")
     print(f"{COLOR_INFO}exit{COLOR_RESET}    - Thoat chuong trinh")
     print("="*50)
     print(f"\n{COLOR_WARNING}Ghi chu:{COLOR_RESET}")
-    print("- Typing indicator: hien thi 'dang soan tin' truoc khi gui")
-    print("- Delay random tu delay-1s den delay+1s (toi thieu 0.5s)")
-    print("- Moi task chay doc lap tren thread rieng")
+    print("- Trong file noi dung, su dung {from} de thay the bang ten nguoi gui")
+    print("- Khi phat hien {from} trong file, tool se hoi ten de thay the")
+    print("- Dung 'thay [id]' de thay doi noi dung file cho task")
+    print("- Dung 'from [id] [ten]' de thay doi ten hien thi")
+    print("- Dung 'list' de xem danh sach task dang doc")
     print("="*50 + "\n")
+
+def process_message_with_from(message, from_name):
+    """Thay thế {from} trong nội dung"""
+    if from_name:
+        return message.replace("{from}", from_name)
+    return message
+
+def get_message_from_file():
+    """Đọc nội dung từ file và kiểm tra {from}"""
+    while True:
+        filename = input("Nhap ten file: ").strip()
+        if os.path.exists(filename):
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                
+                if not content:
+                    print(f"{COLOR_WARNING}File rong, nhap lai:{COLOR_RESET}")
+                    continue
+                
+                # Kiểm tra nếu có {from} trong nội dung
+                if "{from}" in content:
+                    print(f"{COLOR_INFO}Phat hien {from} trong file noi dung{COLOR_RESET}")
+                    print("Nhap ten from muon thay the (de trong neu khong muon thay):")
+                    default_from = input().strip()
+                    if default_from:
+                        print(f"{COLOR_SUCCESS}Se thay '{default_from}' vao vi tri {from}{COLOR_RESET}")
+                        return content, default_from
+                
+                return content, None
+            except Exception as e:
+                print(f"{COLOR_ERROR}Loi doc file: {e}{COLOR_RESET}")
+        else:
+            print(f"{COLOR_ERROR}File khong ton tai, nhap lai:{COLOR_RESET}")
+
+def change_task_content(task_id):
+    """Thay đổi nội dung file cho task"""
+    print(f"{COLOR_INFO}Nhap ten file moi cho task {task_id}:{COLOR_RESET}")
+    new_content, default_from = get_message_from_file()
+    
+    if new_content:
+        task_messages[task_id] = new_content
+        if default_from:
+            task_from_names[task_id] = default_from
+        print(f"{COLOR_SUCCESS}Da thay noi dung cho task {task_id}{COLOR_RESET}")
+    else:
+        print(f"{COLOR_ERROR}Khong the thay doi noi dung{COLOR_RESET}")
+
+def change_task_from(task_id, new_from=None):
+    """Thay đổi tên from cho task"""
+    if new_from:
+        task_from_names[task_id] = new_from
+        print(f"{COLOR_SUCCESS}Da thay from cho task {task_id} thanh: {new_from}{COLOR_RESET}")
+    else:
+        if task_id in task_from_names:
+            del task_from_names[task_id]
+        print(f"{COLOR_SUCCESS}Da xoa from cho task {task_id}{COLOR_RESET}")
+
+def show_task_list():
+    """Hiển thị danh sách task dạng dọc"""
+    if not tasks:
+        print(f"\n{COLOR_WARNING}=== KHONG CO TASK NAO ==={COLOR_RESET}\n")
+        return
+    
+    print("\n" + "="*70)
+    print("DANH SACH TASK")
+    print("="*70)
+    
+    for idx, task in enumerate(tasks, 1):
+        status = f"{COLOR_SUCCESS}🟢 Dang chay{COLOR_RESET}" if task.running else f"{COLOR_ERROR}🔴 Da dung{COLOR_RESET}"
+        uptime = get_uptime(task.start_time)
+        user_id = get_uid_from_cookie(task.cookie) or "Unknown"
+        from_name = task_from_names.get(task.task_id, "Khong co")
+        
+        # Lấy nội dung message preview
+        msg_preview = task_messages.get(task.task_id, task.message_template)
+        msg_preview = msg_preview[:50] + "..." if len(msg_preview) > 50 else msg_preview
+        
+        print(f"\n{COLOR_INFO}📌 Task {task.task_id}{COLOR_RESET}")
+        print(f"   ├─ UID       : {user_id}")
+        print(f"   ├─ ID Box    : {task.idbox_list}")
+        print(f"   ├─ Status    : {status}")
+        print(f"   ├─ From      : {from_name}")
+        print(f"   ├─ Delay     : {task.delay}s")
+        print(f"   ├─ Typing    : {task.typing_delay}s")
+        print(f"   ├─ OK/Fail   : {task.success}/{task.fail}")
+        print(f"   ├─ Uptime    : {uptime}")
+        print(f"   └─ Noi dung  : {msg_preview}")
+    
+    print("\n" + "="*70)
+    print(f"Tong so task: {len(tasks)}")
+    print("="*70 + "\n")
 
 class FacebookTypingMQTT:
     def __init__(self, cookies, options=None):
@@ -286,11 +390,11 @@ class FacebookTypingMQTT:
             self.connected = False
 
 class Task:
-    def __init__(self, task_id, cookie, idbox_list, message, delay, typing_delay):
+    def __init__(self, task_id, cookie, idbox_list, message_template, delay, typing_delay):
         self.task_id = task_id
         self.cookie = cookie
         self.idbox_list = idbox_list
-        self.message = message
+        self.message_template = message_template
         self.delay = delay
         self.typing_delay = typing_delay
         self.running = True
@@ -299,6 +403,17 @@ class Task:
         self.start_time = datetime.now()
         self.success = 0
         self.fail = 0
+        self.uid = get_uid_from_cookie(cookie)
+        
+    def get_message(self):
+        """Lấy nội dung tin nhắn đã thay thế {from}"""
+        # Lấy từ task_messages nếu có, nếu không dùng message_template
+        current_message = task_messages.get(self.task_id, self.message_template)
+        from_name = task_from_names.get(self.task_id, None)
+        
+        if from_name:
+            return current_message.replace("{from}", from_name)
+        return current_message.replace("{from}", f"User_{self.uid}" if self.uid else "Unknown")
         
     def start(self):
         self.thread = threading.Thread(target=self.run)
@@ -330,6 +445,9 @@ class Task:
                     
                     msg_id = str(int(time.time() * 1000))
                     
+                    # Lấy nội dung tin nhắn đã thay thế {from}
+                    message = self.get_message()
+                    
                     try:
                         if simulate_typing:
                             self.typing_client.send_typing_indicator(self.idbox_list, True)
@@ -339,7 +457,7 @@ class Task:
                         pass
                     
                     payload = {
-                        "body": self.message,
+                        "body": message,
                         "msgid": msg_id,
                         "sender_fbid": token.split('|')[0] if '|' in token else token,
                         "to": self.idbox_list,
@@ -359,7 +477,8 @@ class Task:
                             self.fail += 1
                     
                     uptime = get_uptime(self.start_time)
-                    print(f"[Task {self.task_id}] {self.idbox_list} | OK:{self.success} FAIL:{self.fail} | Uptime:{uptime}".ljust(100), end='\r')
+                    from_display = task_from_names.get(self.task_id, "Chua dat")
+                    print(f"[Task {self.task_id}] {self.idbox_list} | OK:{self.success} FAIL:{self.fail} | Uptime:{uptime} | From: {from_display}".ljust(100), end='\r')
                     
                     time.sleep(current_delay)
                     
@@ -385,7 +504,7 @@ def get_token(cookie):
     return f"{c_user}|{xs}" if c_user and xs else cookie
 
 def add_multiple_tasks():
-    global tasks, task_counter, current_delay, simulate_typing, idbox_list, message_content
+    global tasks, task_counter, current_delay, simulate_typing, idbox_list
     
     print("\n" + "="*50)
     print("NHAP THONG TIN CHUNG")
@@ -398,16 +517,10 @@ def add_multiple_tasks():
         return
     
     # Nhap file txt chung
-    file_path = input("Nhap file txt: ").strip()
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            message_content = f.read().strip()
-        if not message_content:
-            print("File khong co noi dung")
-            return
-        print(f"Da doc noi dung tu file: {file_path}")
-    except Exception as e:
-        print(f"Loi doc file: {e}")
+    print("\nNhap file noi dung:")
+    message_content, default_from = get_message_from_file()
+    if not message_content:
+        print("Khong co noi dung")
         return
     
     # Nhap delay chung
@@ -453,7 +566,13 @@ def add_multiple_tasks():
         task = Task(task_counter, cookie, idbox_list, message_content, current_delay, typing_delay)
         task.start()
         tasks.append(task)
-        print(f"{COLOR_SUCCESS}Da tao Task {task_counter} cho cookie {get_token(cookie).split('|')[0]}{COLOR_RESET}")
+        
+        # Lưu message và from cho task
+        task_messages[task_counter] = message_content
+        if default_from:
+            task_from_names[task_counter] = default_from
+        
+        print(f"{COLOR_SUCCESS}Da tao Task {task_counter} cho UID: {get_uid_from_cookie(cookie) or 'Khong xac dinh'}{COLOR_RESET}")
     
     print(f"\n{COLOR_SUCCESS}Da tao xong {len(cookie_list)} task{COLOR_RESET}")
 
@@ -474,15 +593,10 @@ def add_single_task():
         print("Khong co ID Box")
         return
     
-    file_path = input("Nhap file txt: ").strip()
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            message = f.read().strip()
-        if not message:
-            print("File khong co noi dung")
-            return
-    except Exception as e:
-        print(f"Loi doc file: {e}")
+    print("\nNhap file noi dung:")
+    message, default_from = get_message_from_file()
+    if not message:
+        print("Khong co noi dung")
         return
     
     try:
@@ -501,7 +615,13 @@ def add_single_task():
     task = Task(task_counter, cookie, idbox, message, delay, typing_delay)
     task.start()
     tasks.append(task)
-    print(f"{COLOR_SUCCESS}Da them Task {task_counter}{COLOR_RESET}")
+    
+    # Lưu message và from cho task
+    task_messages[task_counter] = message
+    if default_from:
+        task_from_names[task_counter] = default_from
+    
+    print(f"{COLOR_SUCCESS}Da them Task {task_counter} cho UID: {get_uid_from_cookie(cookie) or 'Khong xac dinh'}{COLOR_RESET}")
 
 def stop_task():
     global tasks
@@ -510,37 +630,91 @@ def stop_task():
         return
     
     print("\nDanh sach task:")
-    for i, task in enumerate(tasks):
+    for i, task in enumerate(tasks, 1):
         status = "DANG CHAY" if task.running else "DA DUNG"
         uptime = get_uptime(task.start_time)
-        user_id = get_token(task.cookie).split('|')[0] if '|' in task.cookie else task.cookie[:20]
-        print(f"{i+1}. Task {task.task_id} - UID: {user_id} - ID: {task.idbox_list} - OK:{task.success} FAIL:{task.fail} - Uptime:{uptime} - {status}")
+        user_id = get_uid_from_cookie(task.cookie) or "Unknown"
+        from_display = task_from_names.get(task.task_id, "Khong co")
+        print(f"{i}. Task {task.task_id} - UID: {user_id} - From: {from_display} - OK:{task.success} FAIL:{task.fail} - {status}")
     
     try:
         choice = int(input("Chon task de dung (nhap so): ")) - 1
         if 0 <= choice < len(tasks):
             tasks[choice].stop()
             print(f"{COLOR_SUCCESS}Da dung Task {tasks[choice].task_id}{COLOR_RESET}")
+            # Xóa dữ liệu của task
+            tid = tasks[choice].task_id
+            if tid in task_messages:
+                del task_messages[tid]
+            if tid in task_from_names:
+                del task_from_names[tid]
             tasks.pop(choice)
         else:
             print("Lua chon khong hop le")
     except:
         print("Lua chon khong hop le")
 
-def list_tasks():
+def change_task_content_cmd():
+    """Xử lý lệnh thay đổi nội dung"""
+    global tasks
     if not tasks:
-        print("Khong co task nao dang chay")
+        print("Khong co task nao")
         return
     
-    print("\n" + "="*70)
-    print("DANH SACH TASK")
-    print("="*70)
-    for i, task in enumerate(tasks):
-        status = f"{COLOR_SUCCESS}DANG CHAY{COLOR_RESET}" if task.running else f"{COLOR_ERROR}DA DUNG{COLOR_RESET}"
-        uptime = get_uptime(task.start_time)
-        user_id = get_token(task.cookie).split('|')[0] if '|' in task.cookie else task.cookie[:20]
-        print(f"{i+1}. Task {task.task_id} | UID: {user_id} | ID: {task.idbox_list} | Delay: {task.delay}s | Typing: {task.typing_delay}s | OK:{task.success} FAIL:{task.fail} | Uptime:{uptime} | {status}")
-    print("="*70)
+    try:
+        task_id = int(input("Nhap ID task can thay noi dung: ").strip())
+        task_found = None
+        for task in tasks:
+            if task.task_id == task_id:
+                task_found = task
+                break
+        
+        if task_found:
+            change_task_content(task_id)
+        else:
+            print(f"Khong tim thay task {task_id}")
+    except:
+        print("ID task khong hop le")
+
+def change_task_from_cmd():
+    """Xử lý lệnh thay đổi tên from"""
+    global tasks
+    if not tasks:
+        print("Khong co task nao")
+        return
+    
+    print("Cu phap: from [task_id] [ten_moi] hoac from all [ten_moi]")
+    cmd = input("Nhap lenh: ").strip()
+    parts = cmd.split(' ', 2)
+    
+    if len(parts) < 2:
+        print("Cu phap khong hop le")
+        return
+    
+    target = parts[0]
+    name = parts[1] if len(parts) == 2 else ' '.join(parts[1:])
+    
+    if target.lower() == 'all':
+        confirm = input(f"Thay doi ten cho TAT CA {len(tasks)} task thanh '{name}'? (y/n): ").strip().lower()
+        if confirm in ['y', 'yes', '1']:
+            for task in tasks:
+                change_task_from(task.task_id, name)
+            print(f"{COLOR_SUCCESS}Da thay doi ten cho {len(tasks)} task{COLOR_RESET}")
+    else:
+        try:
+            task_id = int(target)
+            task_found = None
+            for task in tasks:
+                if task.task_id == task_id:
+                    task_found = task
+                    break
+            
+            if task_found:
+                change_task_from(task_id, name)
+            else:
+                print(f"Khong tim thay task {task_id}")
+        except:
+            print("ID task khong hop le")
 
 def stop_all():
     global tasks, running
@@ -548,6 +722,8 @@ def stop_all():
     for task in tasks:
         task.stop()
     tasks.clear()
+    task_messages.clear()
+    task_from_names.clear()
     print("Da dung tat ca")
 
 def set_delay():
@@ -605,7 +781,11 @@ def main():
             elif cmd == 'stop':
                 stop_task()
             elif cmd == 'list':
-                list_tasks()
+                show_task_list()
+            elif cmd == 'thay':
+                change_task_content_cmd()
+            elif cmd == 'from':
+                change_task_from_cmd()
             elif cmd == 'delay':
                 set_delay()
             elif cmd == 'typing':
