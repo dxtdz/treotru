@@ -4,6 +4,7 @@ import aiohttp
 import os
 import threading
 import queue
+import re
 
 # Global variables
 tasks = {}
@@ -11,6 +12,7 @@ task_counter = 0
 input_queue = queue.Queue()
 running = True
 task_messages = {}  # Lưu nội dung message cho từng task
+task_from_names = {}  # Lưu tên from cho từng task
 
 # Danh sách User Agents
 USER_AGENTS = [
@@ -35,6 +37,12 @@ def assign_user_agent(token):
         ua_index += 1
         print(f"[XuanThang] Da gan User Agent cho token {token[:20]}...")
     return token_user_agents[token]
+
+def process_message_with_from(message, from_name):
+    """Thay thế {from} trong nội dung"""
+    if from_name:
+        return message.replace("{from}", from_name)
+    return message
 
 async def keep_typing(session, url_typing, headers):
     """Liên tục gửi typing indicator"""
@@ -67,10 +75,16 @@ async def spam_message(task_id, token, channel_id, delay):
                     await asyncio.sleep(1)
                     continue
                 
+                # Lấy tên from cho task này
+                from_name = task_from_names.get(task_id, "")
+                
+                # Xử lý nội dung với {from}
+                final_message = process_message_with_from(current_message, from_name)
+                
                 typing_task = asyncio.create_task(keep_typing(session, url_typing, headers))
                 await asyncio.sleep(1.5)
                 
-                async with session.post(url_send, json={"content": current_message}) as resp:
+                async with session.post(url_send, json={"content": final_message}) as resp:
                     if resp.status == 200:
                         print(f"[XuanThang] [{task_id}] {token[:20]}... Da Gui Thanh Cong (200)")
                     elif resp.status == 429:
@@ -98,13 +112,24 @@ async def spam_message(task_id, token, channel_id, delay):
     print(f"[XuanThang] [{task_id}] Da dung task")
 
 def get_message_from_file():
-    """Đọc nội dung từ file"""
+    """Đọc nội dung từ file và kiểm tra {from}"""
     while True:
         filename = input().strip()
         if os.path.exists(filename):
             try:
                 with open(filename, 'r', encoding='utf-8') as f:
-                    return f.read()
+                    content = f.read()
+                
+                # Kiểm tra nếu có {from} trong nội dung
+                if "{from}" in content:
+                    print("[XuanThang] Phat hien {from} trong file noi dung")
+                    print("Nhap ten from muon thay the (de trong neu khong muon thay):")
+                    default_from = input().strip()
+                    if default_from:
+                        print(f"[XuanThang] Se thay {default_from} vao vi tri {from}")
+                        return content, default_from
+                
+                return content, None
             except:
                 pass
         print("File khong ton tai, nhap lai:")
@@ -112,9 +137,23 @@ def get_message_from_file():
 def change_task_content(task_id):
     """Thay đổi nội dung file cho task"""
     print(f"Nhap ten file moi cho task {task_id}:")
-    new_content = get_message_from_file()
+    new_content, default_from = get_message_from_file()
     task_messages[task_id] = new_content
+    if default_from:
+        task_from_names[task_id] = default_from
     print(f"[XuanThang] Da thay noi dung cho task {task_id}")
+
+def change_task_from(task_id):
+    """Thay đổi tên from cho task"""
+    print(f"Nhap ten from moi cho task {task_id} (de trong de bo):")
+    new_from = input().strip()
+    if new_from:
+        task_from_names[task_id] = new_from
+        print(f"[XuanThang] Da thay from cho task {task_id} thanh: {new_from}")
+    else:
+        if task_id in task_from_names:
+            del task_from_names[task_id]
+        print(f"[XuanThang] Da xoa from cho task {task_id}")
 
 def get_tokens_from_input():
     """Nhập token mới từ input, tự động gán User Agent"""
@@ -175,12 +214,14 @@ def show_task_list():
         ua_preview = ua[:50] + "..." if len(ua) > 50 else ua
         msg_preview = task_messages.get(tid, "Chua co noi dung")
         msg_preview = msg_preview[:50] + "..." if len(msg_preview) > 50 else msg_preview
+        from_name = task_from_names.get(tid, "Khong co")
         
         print(f"\n📌 Task {tid}")
         print(f"   ├─ Token     : {token_preview}")
         print(f"   ├─ Channel   : {channel_preview}")
         print(f"   ├─ Status    : {status}")
         print(f"   ├─ User Agent: {ua_preview}")
+        print(f"   ├─ From      : {from_name}")
         print(f"   └─ Noi dung  : {msg_preview}")
     
     print("\n" + "="*60)
@@ -204,6 +245,16 @@ async def add_new_tasks():
                             print(f"[XuanThang] Da dung task {task_id}")
                     except:
                         pass
+                
+                elif cmd.startswith("from "):
+                    try:
+                        task_id = int(cmd.split()[1])
+                        if task_id in tasks:
+                            change_task_from(task_id)
+                        else:
+                            print(f"[XuanThang] Khong tim thay task {task_id}")
+                    except:
+                        print("[XuanThang] Sai cu phap. Dung: from [id]")
                         
                 elif cmd.startswith("thay "):
                     try:
@@ -226,7 +277,7 @@ async def add_new_tasks():
                     print("Nhap delay (giay) cho tung token:")
                     new_delays = get_delays_from_input(new_tokens)
                     print("Nhap ten file noi dung:")
-                    message = get_message_from_file()
+                    message, default_from = get_message_from_file()
                     
                     for token_idx, token in enumerate(new_tokens):
                         for channel in new_channels:
@@ -239,6 +290,9 @@ async def add_new_tasks():
                                 "channel": channel
                             }
                             task_messages[task_id] = message
+                            if default_from:
+                                task_from_names[task_id] = default_from
+                            
                             asyncio.create_task(spam_message(task_id, token, channel, new_delays[token_idx]))
                             print(f"[XuanThang] Da them task {task_id}")
                             
@@ -247,6 +301,7 @@ async def add_new_tasks():
                     print("list          - Xem danh sach task (dang doc)")
                     print("stop [id]     - Dung task theo id")
                     print("thay [id]     - Thay file noi dung cho task")
+                    print("from [id]     - Thay ten from cho task")
                     print("add           - Them token/channel moi")
                     print("help          - Hien thi huong dan")
                     print("=====================\n")
@@ -279,7 +334,7 @@ async def main():
     initial_delays = get_delays_from_input(initial_tokens)
     
     print("\nNhap ten file noi dung:")
-    message = get_message_from_file()
+    message, default_from = get_message_from_file()
     
     # Khởi tạo task ban đầu
     for token_idx, token in enumerate(initial_tokens):
@@ -293,6 +348,9 @@ async def main():
                 "channel": channel
             }
             task_messages[task_id] = message
+            if default_from:
+                task_from_names[task_id] = default_from
+            
             asyncio.create_task(spam_message(task_id, token, channel, initial_delays[token_idx]))
     
     print(f"\n[XuanThang] Da khoi tao {task_counter} task")
