@@ -11,27 +11,11 @@ import uuid
 import ssl
 import json
 import hashlib
-import signal
-import multiprocessing
 from datetime import datetime
 from collections import defaultdict
 import warnings
 
 warnings.filterwarnings("ignore")
-
-# ==================== CAU HINH CPU GUARD ====================
-TARGET_CPU_PERCENT = 10.0  # Mục tiêu CPU dưới 10%
-CHECK_INTERVAL = 1.0       # Kiểm tra mỗi 1 giây
-RESUME_FACTOR = 0.75       # Resume khi CPU < 7.5%
-MAX_SUSPEND_SECONDS = 30   # Tạm dừng tối đa 30s
-MIN_SUSPEND_SECONDS = 0.05 # Tạm dừng tối thiểu 0.05s
-
-USE_PSUTIL = True
-try:
-    import psutil
-except Exception:
-    psutil = None
-    USE_PSUTIL = False
 
 def install_packages():
     packages = ['paho-mqtt', 'psutil', 'requests', 'pyfiglet', 'termcolor', 'bs4']
@@ -47,140 +31,6 @@ install_packages()
 import paho.mqtt.client as mqtt
 from termcolor import colored
 from bs4 import BeautifulSoup
-
-# ==================== CPU GUARD FUNCTIONS ====================
-def _get_num_cpus():
-    try:
-        return os.cpu_count() or 1
-    except Exception:
-        return 1
-
-NUM_CPUS = _get_num_cpus()
-PARENT_PID = os.getpid()
-_CPU_GUARD_WATCHDOG = None
-
-def _measure_process_cpu_percent_fallback(pid, interval):
-    """Fallback khi không có psutil"""
-    try:
-        if pid != os.getpid():
-            return 0.0
-        t0 = time.perf_counter()
-        cpu0 = time.process_time()
-        time.sleep(interval)
-        t1 = time.perf_counter()
-        cpu1 = time.process_time()
-        wall = t1 - t0
-        if wall <= 0:
-            return 0.0
-        cpu_delta = cpu1 - cpu0
-        percent = (cpu_delta / wall) * 100.0
-        return max(0.0, percent)
-    except Exception:
-        return 0.0
-
-def _suspend_process_unix(pid):
-    try:
-        os.kill(pid, signal.SIGSTOP)
-        return True
-    except Exception:
-        return False
-
-def _resume_process_unix(pid):
-    try:
-        os.kill(pid, signal.SIGCONT)
-        return True
-    except Exception:
-        return False
-
-def _suspend_process_psutil(p_proc):
-    try:
-        p_proc.suspend()
-        return True
-    except Exception:
-        return False
-
-def _resume_process_psutil(p_proc):
-    try:
-        p_proc.resume()
-        return True
-    except Exception:
-        return False
-
-def _watchdog_main():
-    """Watchdog chạy trong thread riêng: giám sát CPU và suspend/resume"""
-    use_ps = USE_PSUTIL and (psutil is not None)
-    if use_ps:
-        try:
-            p = psutil.Process(PARENT_PID)
-        except Exception:
-            p = None
-            use_ps = False
-    else:
-        p = None
-
-    target = TARGET_CPU_PERCENT
-    resume_threshold = target * RESUME_FACTOR
-    
-    print(f"{COLOR_INFO}[CPU Guard] Khoi dong - Muc tieu CPU: {target}%{COLOR_RESET}")
-    
-    while True:
-        try:
-            # Đo CPU
-            if use_ps:
-                try:
-                    usage = p.cpu_percent(interval=CHECK_INTERVAL)
-                except Exception:
-                    usage = 0.0
-            else:
-                usage = _measure_process_cpu_percent_fallback(PARENT_PID, CHECK_INTERVAL)
-
-            # Nếu CPU vượt target -> suspend
-            if usage > target:
-                suspend_time = min(MAX_SUSPEND_SECONDS, 
-                                  max(MIN_SUSPEND_SECONDS, 
-                                      CHECK_INTERVAL * (usage / target - 1) * 2))
-                
-                print(f"{COLOR_WARNING}[CPU Guard] CPU: {usage:.1f}% > {target}% - Suspend {suspend_time:.2f}s{COLOR_RESET}")
-                
-                # Suspend process
-                suspended = False
-                if use_ps and p is not None:
-                    suspended = _suspend_process_psutil(p)
-                else:
-                    if hasattr(signal, "SIGSTOP"):
-                        suspended = _suspend_process_unix(PARENT_PID)
-                
-                if suspended:
-                    time.sleep(suspend_time)
-                    # Resume process
-                    if use_ps and p is not None:
-                        _resume_process_psutil(p)
-                    else:
-                        if hasattr(signal, "SIGCONT"):
-                            _resume_process_unix(PARENT_PID)
-                    print(f"{COLOR_SUCCESS}[CPU Guard] Resume - CPU: {usage:.1f}%{COLOR_RESET}")
-                    time.sleep(0.5)
-                else:
-                    time.sleep(min(suspend_time, 1.0))
-            else:
-                # CPU ổn định, ngủ nhẹ
-                time.sleep(CHECK_INTERVAL)
-                
-        except Exception as e:
-            time.sleep(1.0)
-
-def start_cpu_guard():
-    """Khởi động CPU Guard trong thread riêng"""
-    global _CPU_GUARD_WATCHDOG
-    
-    if os.getenv("CPU_GUARD_DISABLE", "0") == "1":
-        print(f"{COLOR_WARNING}[CPU Guard] Da tat bang bien moi truong{COLOR_RESET}")
-        return None
-    
-    _CPU_GUARD_WATCHDOG = threading.Thread(target=_watchdog_main, daemon=True)
-    _CPU_GUARD_WATCHDOG.start()
-    print(f"{COLOR_SUCCESS}[CPU Guard] Da khoi dong - Gioi han CPU: {TARGET_CPU_PERCENT}%{COLOR_RESET}")
-    return _CPU_GUARD_WATCHDOG
 
 # ==================== CAU HINH MESSENGER ====================
 COOKIE_RESET_TIME = 21600  # 6 gio
@@ -200,7 +50,7 @@ message_content = ""
 message_files = []
 current_file_index = 0
 
-# ==================== THÊM QUẢN LÝ FROM ====================
+# Quản lý FROM cho từng task
 task_messages = {}      # Lưu nội dung message cho từng task
 task_from_names = {}    # Lưu tên from cho từng task
 
@@ -316,7 +166,7 @@ def get_uptime(start_time):
 def clear():
     os.system('cls' if os.name == 'nt' else 'clear')
 
-# ==================== THÊM HÀM XỬ LÝ FROM ====================
+# ==================== HÀM XỬ LÝ FROM ====================
 def process_message_with_from(message, from_name):
     """Thay thế {from} trong nội dung"""
     if from_name:
@@ -622,7 +472,6 @@ class Task:
     
     def get_message(self):
         """Lấy nội dung tin nhắn đã thay thế {from}"""
-        # Lấy từ task_messages nếu có, nếu không dùng message
         current_message = task_messages.get(self.task_id, self.message)
         from_name = task_from_names.get(self.task_id, None)
         
@@ -697,7 +546,6 @@ class Task:
                     if current_delay < 0.5:
                         current_delay = 0.5
                     
-                    # Lấy nội dung đã thay thế {from}
                     final_message = self.get_message()
                     
                     if simulate_typing and self.typing_client:
@@ -745,7 +593,6 @@ def add_multiple_tasks():
         print("Khong co ID Box")
         return
     
-    # Sử dụng hàm get_message_from_file để đọc file và xử lý {from}
     print("\nNhap file noi dung:")
     message_content, default_from = get_message_from_file()
     if not message_content:
@@ -799,7 +646,6 @@ def add_multiple_tasks():
         task.start()
         tasks.append(task)
         
-        # Lưu message và from cho task
         task_messages[task_counter] = message_content
         if default_from:
             task_from_names[task_counter] = default_from
@@ -822,7 +668,6 @@ def show_task_list():
         uptime = get_uptime(task.start_time)
         from_name = task_from_names.get(task.task_id, "Khong co")
         
-        # Lấy nội dung message preview
         msg_preview = task_messages.get(task.task_id, task.message)
         msg_preview = msg_preview[:50] + "..." if len(msg_preview) > 50 else msg_preview
         
@@ -842,7 +687,6 @@ def show_task_list():
     print("="*80 + "\n")
 
 def list_tasks():
-    """Giữ lại hàm cũ để tương thích"""
     show_task_list()
 
 def stop_task():
@@ -857,7 +701,6 @@ def stop_task():
         if 0 <= choice < len(tasks):
             tid = tasks[choice].task_id
             tasks[choice].stop()
-            # Xóa dữ liệu của task
             if tid in task_messages:
                 del task_messages[tid]
             if tid in task_from_names:
@@ -877,7 +720,6 @@ def stop_all():
     running = False
 
 def change_task_content_cmd():
-    """Xử lý lệnh thay đổi nội dung"""
     global tasks
     if not tasks:
         print("Khong co task nao")
@@ -899,7 +741,6 @@ def change_task_content_cmd():
         print("ID task khong hop le")
 
 def change_task_from_cmd():
-    """Xử lý lệnh thay đổi tên from"""
     global tasks
     if not tasks:
         print("Khong co task nao")
@@ -952,8 +793,7 @@ def show_help():
     print("help    - Hien thi giup do")
     print("exit    - Thoat")
     print("="*50)
-    print(f"\n{COLOR_INFO}[CPU Guard] Gioi han CPU: {TARGET_CPU_PERCENT}%{COLOR_RESET}")
-    print(f"{COLOR_INFO}[From] Su dung {{from}} trong file de thay the ten nguoi gui{COLOR_RESET}")
+    print(f"\n{COLOR_INFO}[From] Su dung {{from}} trong file de thay the ten nguoi gui{COLOR_RESET}")
     print("="*50)
 
 def auto_clean_memory():
@@ -962,10 +802,13 @@ def auto_clean_memory():
         while running:
             time.sleep(60)
             gc.collect()
-            if psutil:
+            try:
+                import psutil
                 process = psutil.Process()
                 memory = process.memory_info().rss / 1024 / 1024
                 print(f"\n{COLOR_INFO}[CLEAN] RAM: {memory:.2f} MB | Tasks: {len(tasks)}{COLOR_RESET}")
+            except:
+                pass
     
     thread = threading.Thread(target=clean_loop, daemon=True)
     thread.start()
@@ -973,12 +816,9 @@ def auto_clean_memory():
 def main():
     clear()
     
-    # Khoi dong CPU Guard
-    start_cpu_guard()
-    
     print("="*50)
-    print("TOOL TREO MQTT AEPHATXIT")
-    print("CPU Guard: Gioi han duoi 10% CPU")
+    print("Dinh Xuan Thang")
+    print("Ho tro {from} trong noi dung")
     print("="*50)
     print("Go 'help' de xem danh sach lenh")
     print("="*50)
