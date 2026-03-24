@@ -1,10 +1,166 @@
-# -*- coding: utf-8 -*-
+ # -*- coding: utf-8 -*-
 import asyncio
 import aiohttp
 import os
 import threading
 import queue
 import re
+import random
+import time
+import signal
+import gc
+from datetime import datetime
+from collections import defaultdict
+
+# ==================== CPU GUARD CONFIG ====================
+TARGET_CPU_PERCENT = 10.0  # Mục tiêu CPU dưới 10%
+CHECK_INTERVAL = 1.0       # Kiểm tra mỗi 1 giây
+RESUME_FACTOR = 0.75       # Resume khi CPU < 7.5%
+MAX_SUSPEND_SECONDS = 30   # Tạm dừng tối đa 30s
+MIN_SUSPEND_SECONDS = 0.05 # Tạm dừng tối thiểu 0.05s
+
+USE_PSUTIL = True
+try:
+    import psutil
+except Exception:
+    psutil = None
+    USE_PSUTIL = False
+
+# ==================== CPU GUARD FUNCTIONS ====================
+PARENT_PID = os.getpid()
+_CPU_GUARD_WATCHDOG = None
+
+def _get_num_cpus():
+    try:
+        return os.cpu_count() or 1
+    except Exception:
+        return 1
+
+NUM_CPUS = _get_num_cpus()
+
+def _measure_process_cpu_percent_fallback(pid, interval):
+    """Fallback khi không có psutil"""
+    try:
+        if pid != os.getpid():
+            return 0.0
+        t0 = time.perf_counter()
+        cpu0 = time.process_time()
+        time.sleep(interval)
+        t1 = time.perf_counter()
+        cpu1 = time.process_time()
+        wall = t1 - t0
+        if wall <= 0:
+            return 0.0
+        cpu_delta = cpu1 - cpu0
+        percent = (cpu_delta / wall) * 100.0
+        return max(0.0, percent)
+    except Exception:
+        return 0.0
+
+def _suspend_process_unix(pid):
+    try:
+        os.kill(pid, signal.SIGSTOP)
+        return True
+    except Exception:
+        return False
+
+def _resume_process_unix(pid):
+    try:
+        os.kill(pid, signal.SIGCONT)
+        return True
+    except Exception:
+        return False
+
+def _suspend_process_psutil(p_proc):
+    try:
+        p_proc.suspend()
+        return True
+    except Exception:
+        return False
+
+def _resume_process_psutil(p_proc):
+    try:
+        p_proc.resume()
+        return True
+    except Exception:
+        return False
+
+def _watchdog_main():
+    """Watchdog chạy trong thread riêng: giám sát CPU và suspend/resume"""
+    use_ps = USE_PSUTIL and (psutil is not None)
+    if use_ps:
+        try:
+            p = psutil.Process(PARENT_PID)
+        except Exception:
+            p = None
+            use_ps = False
+    else:
+        p = None
+
+    target = TARGET_CPU_PERCENT
+    
+    print(f"\033[94m[CPU Guard] Khoi dong - Muc tieu CPU: {target}%\033[0m")
+    
+    while True:
+        try:
+            # Đo CPU
+            if use_ps:
+                try:
+                    usage = p.cpu_percent(interval=CHECK_INTERVAL)
+                except Exception:
+                    usage = 0.0
+            else:
+                usage = _measure_process_cpu_percent_fallback(PARENT_PID, CHECK_INTERVAL)
+
+            # Nếu CPU vượt target -> suspend
+            if usage > target:
+                suspend_time = min(MAX_SUSPEND_SECONDS, 
+                                  max(MIN_SUSPEND_SECONDS, 
+                                      CHECK_INTERVAL * (usage / target - 1) * 2))
+                
+                print(f"\033[93m[CPU Guard] CPU: {usage:.1f}% > {target}% - Suspend {suspend_time:.2f}s\033[0m")
+                
+                # Suspend process
+                suspended = False
+                if use_ps and p is not None:
+                    suspended = _suspend_process_psutil(p)
+                else:
+                    if hasattr(signal, "SIGSTOP"):
+                        suspended = _suspend_process_unix(PARENT_PID)
+                
+                if suspended:
+                    time.sleep(suspend_time)
+                    # Resume process
+                    if use_ps and p is not None:
+                        _resume_process_psutil(p)
+                    else:
+                        if hasattr(signal, "SIGCONT"):
+                            _resume_process_unix(PARENT_PID)
+                    print(f"\033[92m[CPU Guard] Resume - CPU: {usage:.1f}%\033[0m")
+                    time.sleep(0.5)
+                else:
+                    time.sleep(min(suspend_time, 1.0))
+            else:
+                # CPU ổn định, ngủ nhẹ
+                time.sleep(CHECK_INTERVAL)
+                
+        except Exception as e:
+            time.sleep(1.0)
+
+def start_cpu_guard():
+    """Khởi động CPU Guard trong thread riêng"""
+    global _CPU_GUARD_WATCHDOG
+    
+    if os.getenv("CPU_GUARD_DISABLE", "0") == "1":
+        print("\033[93m[CPU Guard] Da tat bang bien moi truong\033[0m")
+        return None
+    
+    _CPU_GUARD_WATCHDOG = threading.Thread(target=_watchdog_main, daemon=True)
+    _CPU_GUARD_WATCHDOG.start()
+    print(f"\033[92m[CPU Guard] Da khoi dong - Gioi han CPU: {TARGET_CPU_PERCENT}%\033[0m")
+    return _CPU_GUARD_WATCHDOG
+
+# ==================== DISCORD BOT CODE ====================
 
 # Global variables
 tasks = {}
@@ -13,6 +169,7 @@ input_queue = queue.Queue()
 running = True
 task_messages = {}  # Lưu nội dung message cho từng task
 task_from_names = {}  # Lưu tên from cho từng task
+task_stats = {}  # Lưu thống kê cho từng task
 
 # Danh sách User Agents
 USER_AGENTS = [
@@ -27,6 +184,22 @@ USER_AGENTS = [
 # Lưu User Agent cho từng token
 token_user_agents = {}
 ua_index = 0
+
+# Màu sắc
+COLOR_ERROR = '\033[91m'
+COLOR_SUCCESS = '\033[92m'
+COLOR_WARNING = '\033[93m'
+COLOR_INFO = '\033[94m'
+COLOR_RESET = '\033[0m'
+
+def get_uptime(start_time):
+    """Lấy thời gian chạy"""
+    if not start_time:
+        return "00:00:00"
+    elapsed = (datetime.now() - start_time).total_seconds()
+    hours, rem = divmod(int(elapsed), 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 def assign_user_agent(token):
     """Gán User Agent cố định cho token"""
@@ -66,6 +239,14 @@ async def spam_message(task_id, token, channel_id, delay):
     url_send = f"https://discord.com/api/v9/channels/{channel_id}/messages"
     url_typing = f"https://discord.com/api/v9/channels/{channel_id}/typing"
     
+    # Khởi tạo thống kê
+    if task_id not in task_stats:
+        task_stats[task_id] = {
+            'success': 0,
+            'fail': 0,
+            'start_time': datetime.now()
+        }
+    
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         while tasks.get(task_id, {}).get("active", True):
@@ -81,11 +262,14 @@ async def spam_message(task_id, token, channel_id, delay):
                 # Xử lý nội dung với {from}
                 final_message = process_message_with_from(current_message, from_name)
                 
+                # Gửi typing indicator
                 typing_task = asyncio.create_task(keep_typing(session, url_typing, headers))
                 await asyncio.sleep(1.5)
                 
+                # Gửi tin nhắn
                 async with session.post(url_send, json={"content": final_message}) as resp:
                     if resp.status == 200:
+                        task_stats[task_id]['success'] += 1
                         print(f"[XuanThang] [{task_id}] {token[:20]}... Da Gui Thanh Cong (200)")
                     elif resp.status == 429:
                         data = await resp.json()
@@ -93,13 +277,21 @@ async def spam_message(task_id, token, channel_id, delay):
                         typing_task.cancel()
                         await asyncio.sleep(retry)
                         continue
+                    else:
+                        task_stats[task_id]['fail'] += 1
                 
                 typing_task.cancel()
                 
+                # Hiển thị trạng thái
+                uptime = get_uptime(task_stats[task_id]['start_time'])
+                from_display = task_from_names.get(task_id, "Chua dat")
+                status = f"[Task {task_id}] OK:{task_stats[task_id]['success']} FAIL:{task_stats[task_id]['fail']} | Uptime:{uptime} | From: {from_display}"
+                print(status.ljust(100), end='\r')
+                
             except asyncio.CancelledError:
                 pass
-            except:
-                pass
+            except Exception as e:
+                task_stats[task_id]['fail'] += 1
             
             if tasks.get(task_id, {}).get("active", True):
                 try:
@@ -122,38 +314,40 @@ def get_message_from_file():
                 
                 # Kiểm tra nếu có {from} trong nội dung
                 if "{from}" in content:
-                    print("[XuanThang] Phat hien {from} trong file noi dung")
+                    print(f"{COLOR_INFO}Phat hien '{{from}}' trong file noi dung{COLOR_RESET}")
                     print("Nhap ten from muon thay the (de trong neu khong muon thay):")
                     default_from = input().strip()
                     if default_from:
-                        print(f"[XuanThang] Se thay {default_from} vao vi tri {from}")
+                        print(f"{COLOR_SUCCESS}Se thay '{default_from}' vao vi tri '{{from}}'{COLOR_RESET}")
                         return content, default_from
                 
                 return content, None
-            except:
-                pass
-        print("File khong ton tai, nhap lai:")
+            except Exception as e:
+                print(f"{COLOR_ERROR}Loi doc file: {e}{COLOR_RESET}")
+        else:
+            print(f"{COLOR_ERROR}File khong ton tai, nhap lai:{COLOR_RESET}")
 
 def change_task_content(task_id):
     """Thay đổi nội dung file cho task"""
     print(f"Nhap ten file moi cho task {task_id}:")
     new_content, default_from = get_message_from_file()
-    task_messages[task_id] = new_content
-    if default_from:
-        task_from_names[task_id] = default_from
-    print(f"[XuanThang] Da thay noi dung cho task {task_id}")
+    if new_content:
+        task_messages[task_id] = new_content
+        if default_from:
+            task_from_names[task_id] = default_from
+        print(f"{COLOR_SUCCESS}Da thay noi dung cho task {task_id}{COLOR_RESET}")
+    else:
+        print(f"{COLOR_ERROR}Khong the thay doi noi dung{COLOR_RESET}")
 
-def change_task_from(task_id):
+def change_task_from(task_id, new_from=None):
     """Thay đổi tên from cho task"""
-    print(f"Nhap ten from moi cho task {task_id} (de trong de bo):")
-    new_from = input().strip()
     if new_from:
         task_from_names[task_id] = new_from
-        print(f"[XuanThang] Da thay from cho task {task_id} thanh: {new_from}")
+        print(f"{COLOR_SUCCESS}Da thay from cho task {task_id} thanh: {new_from}{COLOR_RESET}")
     else:
         if task_id in task_from_names:
             del task_from_names[task_id]
-        print(f"[XuanThang] Da xoa from cho task {task_id}")
+        print(f"{COLOR_SUCCESS}Da xoa from cho task {task_id}{COLOR_RESET}")
 
 def get_tokens_from_input():
     """Nhập token mới từ input, tự động gán User Agent"""
@@ -199,15 +393,15 @@ def get_delays_from_input(tokens):
 def show_task_list():
     """Hiển thị danh sách task dạng dọc"""
     if not tasks:
-        print("\n=== KHONG CO TASK NAO ===\n")
+        print(f"\n{COLOR_WARNING}=== KHONG CO TASK NAO ==={COLOR_RESET}\n")
         return
     
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print("DANH SACH TASK")
-    print("="*60)
+    print("="*70)
     
     for tid, info in tasks.items():
-        status = "🟢 Dang chay" if info["active"] else "🔴 Dang dung"
+        status = f"{COLOR_SUCCESS}🟢 Dang chay{COLOR_RESET}" if info["active"] else f"{COLOR_ERROR}🔴 Da dung{COLOR_RESET}"
         token_preview = info["token"][:25] + "..."
         channel_preview = info["channel"]
         ua = token_user_agents.get(info["token"], "Chua co UA")
@@ -216,17 +410,22 @@ def show_task_list():
         msg_preview = msg_preview[:50] + "..." if len(msg_preview) > 50 else msg_preview
         from_name = task_from_names.get(tid, "Khong co")
         
-        print(f"\n📌 Task {tid}")
+        stats = task_stats.get(tid, {'success': 0, 'fail': 0})
+        uptime = get_uptime(stats.get('start_time', None))
+        
+        print(f"\n{COLOR_INFO}📌 Task {tid}{COLOR_RESET}")
         print(f"   ├─ Token     : {token_preview}")
         print(f"   ├─ Channel   : {channel_preview}")
         print(f"   ├─ Status    : {status}")
         print(f"   ├─ User Agent: {ua_preview}")
         print(f"   ├─ From      : {from_name}")
+        print(f"   ├─ OK/Fail   : {stats['success']}/{stats['fail']}")
+        print(f"   ├─ Uptime    : {uptime}")
         print(f"   └─ Noi dung  : {msg_preview}")
     
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print(f"Tong so task: {len(tasks)}")
-    print("="*60 + "\n")
+    print("="*70 + "\n")
 
 async def add_new_tasks():
     """Thêm task mới khi có input"""
@@ -242,19 +441,35 @@ async def add_new_tasks():
                         task_id = int(cmd.split()[1])
                         if task_id in tasks:
                             tasks[task_id]["active"] = False
-                            print(f"[XuanThang] Da dung task {task_id}")
+                            print(f"{COLOR_SUCCESS}Da dung task {task_id}{COLOR_RESET}")
                     except:
                         pass
                 
                 elif cmd.startswith("from "):
-                    try:
-                        task_id = int(cmd.split()[1])
-                        if task_id in tasks:
-                            change_task_from(task_id)
-                        else:
-                            print(f"[XuanThang] Khong tim thay task {task_id}")
-                    except:
-                        print("[XuanThang] Sai cu phap. Dung: from [id]")
+                    parts = cmd.split(' ', 2)
+                    if len(parts) >= 2:
+                        try:
+                            task_id = int(parts[1])
+                            if task_id in tasks:
+                                if len(parts) == 3:
+                                    change_task_from(task_id, parts[2])
+                                else:
+                                    change_task_from(task_id)
+                            else:
+                                print(f"{COLOR_ERROR}Khong tim thay task {task_id}{COLOR_RESET}")
+                        except:
+                            print(f"{COLOR_WARNING}Sai cu phap. Dung: from [id] [ten] hoac from [id]{COLOR_RESET}")
+                    else:
+                        print(f"{COLOR_WARNING}Sai cu phap. Dung: from [id] [ten]{COLOR_RESET}")
+                        
+                elif cmd.startswith("fromall "):
+                    name = cmd[8:].strip()
+                    if name:
+                        for tid in tasks:
+                            change_task_from(tid, name)
+                        print(f"{COLOR_SUCCESS}Da thay from cho tat ca {len(tasks)} task thanh: {name}{COLOR_RESET}")
+                    else:
+                        print(f"{COLOR_WARNING}Vui long nhap ten{COLOR_RESET}")
                         
                 elif cmd.startswith("thay "):
                     try:
@@ -262,9 +477,9 @@ async def add_new_tasks():
                         if task_id in tasks:
                             change_task_content(task_id)
                         else:
-                            print(f"[XuanThang] Khong tim thay task {task_id}")
+                            print(f"{COLOR_ERROR}Khong tim thay task {task_id}{COLOR_RESET}")
                     except:
-                        print("[XuanThang] Sai cu phap. Dung: thay [id]")
+                        print(f"{COLOR_WARNING}Sai cu phap. Dung: thay [id]{COLOR_RESET}")
                         
                 elif cmd == "list":
                     show_task_list()
@@ -294,20 +509,37 @@ async def add_new_tasks():
                                 task_from_names[task_id] = default_from
                             
                             asyncio.create_task(spam_message(task_id, token, channel, new_delays[token_idx]))
-                            print(f"[XuanThang] Da them task {task_id}")
+                            print(f"{COLOR_SUCCESS}Da them task {task_id}{COLOR_RESET}")
                             
+                elif cmd == "stopall":
+                    for tid in tasks:
+                        tasks[tid]["active"] = False
+                    tasks.clear()
+                    task_messages.clear()
+                    task_from_names.clear()
+                    task_stats.clear()
+                    print(f"{COLOR_SUCCESS}Da dung tat ca task{COLOR_RESET}")
+                    
                 elif cmd == "help":
-                    print("\n=== LENH DIEU KHIEN ===")
+                    print("\n" + "="*50)
+                    print("DANH SACH LENH")
+                    print("="*50)
                     print("list          - Xem danh sach task (dang doc)")
                     print("stop [id]     - Dung task theo id")
                     print("thay [id]     - Thay file noi dung cho task")
                     print("from [id]     - Thay ten from cho task")
+                    print("from [id] [ten] - Thay ten from cu the")
+                    print("fromall [ten] - Thay ten from cho tat ca task")
                     print("add           - Them token/channel moi")
+                    print("stopall       - Dung tat ca task")
                     print("help          - Hien thi huong dan")
-                    print("=====================\n")
+                    print("="*50)
+                    print(f"\n{COLOR_INFO}[CPU Guard] Gioi han CPU: {TARGET_CPU_PERCENT}%{COLOR_RESET}")
+                    print(f"{COLOR_INFO}[From] Su dung '{{from}}' trong file de thay the ten nguoi gui{COLOR_RESET}")
+                    print("="*50 + "\n")
             
             await asyncio.sleep(0.5)
-        except:
+        except Exception as e:
             await asyncio.sleep(0.5)
 
 def input_listener():
@@ -320,11 +552,36 @@ def input_listener():
         except:
             pass
 
+def auto_clean_memory():
+    """Tự động dọn dẹp bộ nhớ"""
+    def clean_loop():
+        while running:
+            time.sleep(60)
+            gc.collect()
+            if USE_PSUTIL and psutil:
+                process = psutil.Process()
+                memory = process.memory_info().rss / 1024 / 1024
+                print(f"\n{COLOR_INFO}[CLEAN] RAM: {memory:.2f} MB | Tasks: {len(tasks)}{COLOR_RESET}")
+    thread = threading.Thread(target=clean_loop, daemon=True)
+    thread.start()
+
 async def main():
     global task_counter, running
     
+    # Khởi động CPU Guard
+    start_cpu_guard()
+    
+    # Khởi động auto clean memory
+    auto_clean_memory()
+    
+    print("="*60)
+    print("Dinh Xuan Thang ")
+    print("Anh Em Phat Xit")
+    print(f"CPU Guard: Gioi han duoi {TARGET_CPU_PERCENT}%")
+    print("="*60)
+    
     # Nhập thông tin ban đầu
-    print("Nhap token (done de ket thuc):")
+    print("\nNhap token (done de ket thuc):")
     initial_tokens = get_tokens_from_input()
     
     print("\nNhap channel ID (done de ket thuc):")
@@ -353,9 +610,9 @@ async def main():
             
             asyncio.create_task(spam_message(task_id, token, channel, initial_delays[token_idx]))
     
-    print(f"\n[XuanThang] Da khoi tao {task_counter} task")
-    print(f"[XuanThang] Da gan User Agent cho {len(token_user_agents)} token")
-    print("\nGo 'help' de xem lenh dieu khien\n")
+    print(f"\n{COLOR_SUCCESS}Da khoi tao {task_counter} task{COLOR_RESET}")
+    print(f"{COLOR_SUCCESS}Da gan User Agent cho {len(token_user_agents)} token{COLOR_RESET}")
+    print(f"\n{COLOR_INFO}Go 'help' de xem lenh dieu khien{COLOR_RESET}\n")
     
     # Chạy input listener trong thread riêng
     input_thread = threading.Thread(target=input_listener, daemon=True)
@@ -369,4 +626,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         running = False
-        print("\n[XuanThang] Da dung toan bo tool!")
+        print(f"\n{COLOR_SUCCESS}Da dung toan bo tool!{COLOR_RESET}")
